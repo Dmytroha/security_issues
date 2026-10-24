@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+entropy-rng/c/*.o
+entropy-rng/c/*.a
+entropy-rng/c/erng
+entropy-rng/c/test_erng
+entropy-rng/c/test_erng_asan
