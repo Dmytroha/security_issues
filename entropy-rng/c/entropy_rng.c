@@ -260,19 +260,22 @@ static int src_os(erng_sha256 *pool, size_t nbytes, double *credit)
 {
     uint8_t buf[256];
     size_t done = 0;
+    int rc = ERNG_ERR_ENTROPY;
     while (done < nbytes) {
         size_t want = nbytes - done < sizeof buf ? nbytes - done : sizeof buf;
         ssize_t r = getrandom(buf, want, 0);
         if (r < 0) {
             if (errno == EINTR) continue;
-            return ERNG_ERR_ENTROPY;
+            goto out;
         }
         erng_sha256_update(pool, buf, (size_t)r);
         done += (size_t)r;
     }
-    wipe(buf, sizeof buf);
     *credit = 8.0 * (double)nbytes;
-    return ERNG_OK;
+    rc = ERNG_OK;
+out:
+    wipe(buf, sizeof buf);
+    return rc;
 }
 
 static int hwrng_read(uint8_t *buf, size_t n)
@@ -296,17 +299,20 @@ static int hwrng_read(uint8_t *buf, size_t n)
 static int src_hwrng(erng_sha256 *pool, size_t nbytes, double *credit)
 {
     uint8_t buf[256];
+    size_t same = 1;
+    int rc = ERNG_ERR_ENTROPY;
     if (nbytes > sizeof buf) nbytes = sizeof buf;
     if (hwrng_read(buf, nbytes) != 0)
-        return ERNG_ERR_ENTROPY;
-    size_t same = 1;
+        goto out;
     for (size_t i = 1; i < nbytes; i++) same += buf[i] == buf[0];
     if (nbytes > 4 && same == nbytes)
-        return ERNG_ERR_ENTROPY;                 /* stuck device */
+        goto out;                                /* stuck device */
     erng_sha256_update(pool, buf, nbytes);
-    wipe(buf, sizeof buf);
     *credit = 4.0 * (double)nbytes;             /* half credit: hedge against a weak device */
-    return ERNG_OK;
+    rc = ERNG_OK;
+out:
+    wipe(buf, sizeof buf);
+    return rc;
 }
 
 #ifdef ERNG_X86
@@ -323,7 +329,7 @@ static int rdseed64(uint64_t *v)
 #if defined(__x86_64__)
         __asm__ volatile("rdseed %0; setc %1" : "=r"(*v), "=qm"(ok) :: "cc");
 #else
-        uint32_t lo, hi;
+        uint32_t lo = 0, hi = 0;
         __asm__ volatile("rdseed %0; setc %1" : "=r"(lo), "=qm"(ok) :: "cc");
         if (ok) __asm__ volatile("rdseed %0; setc %1" : "=r"(hi), "=qm"(ok) :: "cc");
         *v = (uint64_t)hi << 32 | lo;
@@ -336,20 +342,23 @@ static int rdseed64(uint64_t *v)
 
 static int src_rdseed(erng_sha256 *pool, size_t nbytes, double *credit)
 {
-    uint64_t v, prev = 0;
+    uint64_t v = 0, prev = 0;
     size_t words = (nbytes + 7) / 8;
+    int rc = ERNG_ERR_ENTROPY;
     for (size_t i = 0; i < words; i++) {
         if (rdseed64(&v) != 0)
-            return ERNG_ERR_ENTROPY;
+            goto out;
         /* known silicon bugs return all-zeros or all-ones; also catch a stuck value */
         if (v == 0 || v == UINT64_MAX || (i && v == prev))
-            return ERNG_ERR_ENTROPY;
+            goto out;
         erng_sha256_update(pool, &v, sizeof v);
         prev = v;
     }
-    wipe(&v, sizeof v); wipe(&prev, sizeof prev);
     *credit = 4.0 * (double)nbytes;             /* half credit: RDSEED cannot be audited */
-    return ERNG_OK;
+    rc = ERNG_OK;
+out:
+    wipe(&v, sizeof v); wipe(&prev, sizeof prev);
+    return rc;
 }
 #endif
 
@@ -420,13 +429,13 @@ int erng_jitter_init(erng_jitter *j)
     j->estimate = erng_mcv_min_entropy(s, JITTER_STARTUP);
     j->credit = j->estimate < JITTER_MAX_CREDIT ? j->estimate : JITTER_MAX_CREDIT;
     if (j->estimate < 0.1) {                     /* coarse or virtualised timer */
-        free(s); erng_jitter_free(j);
+        wipe(s, JITTER_STARTUP); free(s); erng_jitter_free(j);
         return ERNG_ERR_ENTROPY;
     }
     erng_health_init(&j->health, j->credit);
     for (int i = 0; i < JITTER_STARTUP; i++)
         if (erng_health_feed(&j->health, s[i]) != 0) {
-            free(s); erng_jitter_free(j);
+            wipe(s, JITTER_STARTUP); free(s); erng_jitter_free(j);
             return ERNG_ERR_ENTROPY;
         }
     wipe(s, JITTER_STARTUP);
@@ -448,28 +457,35 @@ static int src_jitter(erng_jitter *j, erng_sha256 *pool, size_t nbytes, double *
     size_t used = 0;
     int stuck;
 
+    int rc = ERNG_ERR_ENTROPY;
+
     if (j->failed)
         return ERNG_ERR_ENTROPY;
     while (got < want) {
-        if (++n > limit) { j->failed = 1; return ERNG_ERR_ENTROPY; }   /* almost always stuck */
+        if (++n > limit) { j->failed = 1; goto out; }   /* almost always stuck */
         uint8_t s = erng_jitter_sample(j, &stuck);
         if (erng_health_feed(&j->health, s) != 0) {
             j->failed = 1;                       /* permanent: a failed source stays out */
-            return ERNG_ERR_ENTROPY;
+            goto out;
         }
         block[used++] = s;
         if (used == sizeof block) { erng_sha256_update(pool, block, used); used = 0; }
         if (!stuck) got += j->credit;
     }
     erng_sha256_update(pool, block, used);
-    wipe(block, sizeof block);
     *credit = got;
-    return ERNG_OK;
+    rc = ERNG_OK;
+out:
+    wipe(block, sizeof block);
+    return rc;
 }
 
 /* ======================================================================== */
 /* Generator                                                                */
 /* ======================================================================== */
+
+enum { SRC_OS, SRC_HWRNG, SRC_RDSEED, SRC_JITTER, SRC_COUNT };
+static const char *const src_names[SRC_COUNT] = { "os", "hwrng", "rdseed", "jitter" };
 
 struct erng {
     erng_drbg       drbg;           /* first: the secret state */
@@ -478,19 +494,64 @@ struct erng {
     int             has_os, has_hwrng, has_rdseed, has_jitter;
     erng_jitter     jitter;
     uint64_t        fork_gen;
+    int64_t         clock_skew;     /* CLOCK_BOOTTIME - CLOCK_MONOTONIC at the last check, ns */
+    unsigned long   failures[SRC_COUNT];
+    struct erng    *prev, *next;    /* registry of live generators, for the fork handlers */
 };
 
+/* Fork handling. The prepare handler takes every generator's lock, so no thread
+ * is inside a generator when fork() runs: the child never inherits a lock held
+ * by a thread that no longer exists, nor a half-updated DRBG state. */
 static atomic_uint_fast64_t g_fork_gen;
 static pthread_once_t g_atfork_once = PTHREAD_ONCE_INIT;
-static void on_fork_child(void) { atomic_fetch_add(&g_fork_gen, 1); }
-static void register_atfork(void) { pthread_atfork(NULL, NULL, on_fork_child); }
+static pthread_mutex_t g_list_lock = PTHREAD_MUTEX_INITIALIZER;
+static erng_t *g_list;
+
+static void on_fork_prepare(void)
+{
+    pthread_mutex_lock(&g_list_lock);
+    for (erng_t *r = g_list; r; r = r->next)
+        pthread_mutex_lock(&r->lock);
+}
+
+static void on_fork_parent(void)
+{
+    for (erng_t *r = g_list; r; r = r->next)
+        pthread_mutex_unlock(&r->lock);
+    pthread_mutex_unlock(&g_list_lock);
+}
+
+static void on_fork_child(void)
+{
+    atomic_fetch_add(&g_fork_gen, 1);
+    on_fork_parent();
+}
+
+static void register_atfork(void) { pthread_atfork(on_fork_prepare, on_fork_parent, on_fork_child); }
+
+/* Suspend/resume (and, on hypervisors that account the gap as suspended time,
+ * VM snapshot restore) moves CLOCK_BOOTTIME away from CLOCK_MONOTONIC. */
+#define CLOCK_SKEW_RESEED_NS 1000000000LL
+
+static int64_t clock_skew_now(void)
+{
+    struct timespec b, m;
+    if (clock_gettime(CLOCK_BOOTTIME, &b) != 0 || clock_gettime(CLOCK_MONOTONIC, &m) != 0)
+        return 0;
+    return ((int64_t)b.tv_sec - (int64_t)m.tv_sec) * 1000000000LL + (b.tv_nsec - m.tv_nsec);
+}
 
 /* Gather from every source into a pool and emit a 64-byte seed.
- * Two SHA-256 digests with distinct prefixes over the same input (as in Hash_df). */
+ * Two SHA-256 digests with distinct prefixes over the same input (as in Hash_df).
+ *
+ * Credits are NOT summed. The seed is accepted only if one source on its own
+ * credits the full target, so in practice the OS source or the jitter source.
+ * hwrng and RDSEED (half credit) are mixed in as defence in depth but can never
+ * carry the seed, alone or together: they may sit on the same silicon. */
 static int gather(erng_t *r, size_t bits, uint8_t seed[64])
 {
     erng_sha256 pool;
-    double total = 0, c;
+    double best = 0, c;
     size_t nbytes = (bits + 7) / 8;
     uint8_t ctr = 1;
     struct { uint64_t t; pid_t pid; } stamp;
@@ -498,21 +559,23 @@ static int gather(erng_t *r, size_t bits, uint8_t seed[64])
     erng_sha256_init(&pool);
     erng_sha256_update(&pool, "entropy-rng/pool/v1", 19);
 
-#define ADD(name, call) do { \
-        erng_sha256_update(&pool, name, sizeof name); \
-        c = 0; if ((call) == ERNG_OK) total += c; } while (0)
-    if (r->has_os)     ADD("os", src_os(&pool, nbytes, &c));
-    if (r->has_hwrng)  ADD("hwrng", src_hwrng(&pool, nbytes, &c));
+#define ADD(id, call) do { \
+        erng_sha256_update(&pool, src_names[id], strlen(src_names[id]) + 1); \
+        c = 0; \
+        if ((call) == ERNG_OK) { if (c > best) best = c; } \
+        else r->failures[id]++; } while (0)
+    if (r->has_os)     ADD(SRC_OS, src_os(&pool, nbytes, &c));
+    if (r->has_hwrng)  ADD(SRC_HWRNG, src_hwrng(&pool, nbytes, &c));
 #ifdef ERNG_X86
-    if (r->has_rdseed) ADD("rdseed", src_rdseed(&pool, nbytes, &c));
+    if (r->has_rdseed) ADD(SRC_RDSEED, src_rdseed(&pool, nbytes, &c));
 #endif
-    if (r->has_jitter) ADD("jitter", src_jitter(&r->jitter, &pool, nbytes, &c));
+    if (r->has_jitter) ADD(SRC_JITTER, src_jitter(&r->jitter, &pool, nbytes, &c));
 #undef ADD
     stamp.t = jitter_now();
     stamp.pid = getpid();
     erng_sha256_update(&pool, &stamp, sizeof stamp);
 
-    if (total < (double)bits) {
+    if (best < (double)bits) {
         wipe(&pool, sizeof pool);
         return ERNG_ERR_ENTROPY;
     }
@@ -525,12 +588,17 @@ static int gather(erng_t *r, size_t bits, uint8_t seed[64])
     return ERNG_OK;
 }
 
+/* Reseed, and record that the state is now fresh for this process and clock. */
 static int reseed_locked(erng_t *r, const void *add, size_t alen)
 {
     uint8_t seed[64];
+    uint64_t gen = atomic_load(&g_fork_gen);
     int rc = gather(r, SEED_ENTROPY_BITS, seed);
-    if (rc == ERNG_OK)
+    if (rc == ERNG_OK) {
         erng_drbg_reseed(&r->drbg, seed, sizeof seed, add, alen);
+        r->fork_gen = gen;
+        r->clock_skew = clock_skew_now();
+    }
     wipe(seed, sizeof seed);
     return rc;
 }
@@ -556,10 +624,12 @@ int erng_new(erng_t **out, const void *pers, size_t perslen, unsigned flags)
     pthread_mutex_init(&r->lock, NULL);
     r->flags = flags;
     r->fork_gen = atomic_load(&g_fork_gen);
+    r->clock_skew = clock_skew_now();
     r->has_os = !(flags & ERNG_NO_OS);
     if (!(flags & ERNG_NO_HWRNG)) {
         uint8_t b;
         r->has_hwrng = hwrng_read(&b, 1) == 0;
+        wipe(&b, sizeof b);
     }
 #ifdef ERNG_X86
     r->has_rdseed = !(flags & ERNG_NO_RDSEED) && have_rdseed();
@@ -574,6 +644,12 @@ int erng_new(erng_t **out, const void *pers, size_t perslen, unsigned flags)
     }
     erng_drbg_instantiate(&r->drbg, seed, 48, seed + 48, 16, pers, perslen);
     wipe(seed, sizeof seed);
+
+    pthread_mutex_lock(&g_list_lock);
+    r->next = g_list;
+    if (g_list) g_list->prev = r;
+    g_list = r;
+    pthread_mutex_unlock(&g_list_lock);
     *out = r;
     return ERNG_OK;
 }
@@ -581,6 +657,11 @@ int erng_new(erng_t **out, const void *pers, size_t perslen, unsigned flags)
 void erng_free(erng_t *r)
 {
     if (!r) return;
+    pthread_mutex_lock(&g_list_lock);
+    if (r->prev) r->prev->next = r->next;
+    else if (g_list == r) g_list = r->next;
+    if (r->next) r->next->prev = r->prev;
+    pthread_mutex_unlock(&g_list_lock);
     erng_jitter_free(&r->jitter);
     pthread_mutex_destroy(&r->lock);
     wipe(r, sizeof *r);
@@ -602,15 +683,20 @@ int erng_bytes(erng_t *r, void *buf, size_t n)
 {
     uint8_t *p = buf;
     int rc = ERNG_OK;
+    int64_t skew;
     if (!r || (n && !buf)) return ERNG_ERR_ARG;
 
     pthread_mutex_lock(&r->lock);
-    uint64_t gen = atomic_load(&g_fork_gen);
-    if (gen != r->fork_gen) {
+    if (atomic_load(&g_fork_gen) != r->fork_gen) {
         /* we are a forked child: never continue the parent's stream */
         struct { char tag[4]; pid_t pid; } add = { "fork", getpid() };
         if ((rc = reseed_locked(r, &add, sizeof add)) != ERNG_OK) goto out;
-        r->fork_gen = gen;
+    }
+    skew = clock_skew_now() - r->clock_skew;
+    if (skew > CLOCK_SKEW_RESEED_NS || skew < -CLOCK_SKEW_RESEED_NS) {
+        /* resumed from suspend or a snapshot: the state may exist twice */
+        static const char add[] = "resume";
+        if ((rc = reseed_locked(r, add, sizeof add)) != ERNG_OK) goto out;
     }
     while (n) {
         size_t take = n < ERNG_DRBG_MAX_REQUEST ? n : ERNG_DRBG_MAX_REQUEST;
@@ -635,10 +721,11 @@ int erng_uniform(erng_t *r, uint64_t bound, uint64_t *out)
     mask |= mask >> 1; mask |= mask >> 2; mask |= mask >> 4;
     mask |= mask >> 8; mask |= mask >> 16; mask |= mask >> 32;
     do {                                          /* rejection sampling: < 2 tries on average */
-        if ((rc = erng_bytes(r, &v, sizeof v)) != ERNG_OK) return rc;
+        if ((rc = erng_bytes(r, &v, sizeof v)) != ERNG_OK) { wipe(&v, sizeof v); return rc; }
         v &= mask;
     } while (v >= bound);
     *out = v;
+    wipe(&v, sizeof v);
     return ERNG_OK;
 }
 
@@ -648,9 +735,12 @@ void erng_describe(const erng_t *r, char *buf, size_t len)
                      r->has_os ? " os" : "", r->has_hwrng ? " hwrng" : "",
                      r->has_rdseed ? " rdseed" : "");
     if (r->has_jitter && n >= 0 && (size_t)n < len)
-        snprintf(buf + n, len - (size_t)n, " jitter(timer=%s, measured H=%.2f bits/sample, credited %.2f%s)",
-                 erng_jitter_timer_name(), r->jitter.estimate, r->jitter.credit,
-                 r->jitter.failed ? ", FAILED" : "");
+        n += snprintf(buf + n, len - (size_t)n, " jitter(timer=%s, measured H=%.2f bits/sample, credited %.2f%s)",
+                      erng_jitter_timer_name(), r->jitter.estimate, r->jitter.credit,
+                      r->jitter.failed ? ", FAILED" : "");
+    for (int i = 0; i < SRC_COUNT; i++)
+        if (r->failures[i] && n >= 0 && (size_t)n < len)
+            n += snprintf(buf + n, len - (size_t)n, " [%s failed %lu times]", src_names[i], r->failures[i]);
 }
 
 const char *erng_strerror(int err)

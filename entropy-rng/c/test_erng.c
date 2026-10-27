@@ -5,6 +5,7 @@
 
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -114,6 +115,12 @@ static void test_sources(void)
     CHECK(strstr(d, "jitter") && !strstr(d, " os"));
     CHECK(erng_bytes(r, a, 32) == ERNG_OK);
     erng_free(r);
+    /* without getrandom, jitter still seeds on its own */
+    CHECK(erng_new(&r, NULL, 0, ERNG_NO_OS) == ERNG_OK);
+    CHECK(erng_bytes(r, a, 32) == ERNG_OK);
+    erng_free(r);
+    /* half-credit sources (hwrng, RDSEED) never carry the seed, even together */
+    CHECK(erng_new(&r, NULL, 0, ERNG_NO_OS | ERNG_NO_JITTER) == ERNG_ERR_ENTROPY);
     /* with everything disabled, seeding must fail loudly */
     CHECK(erng_new(&r, NULL, 0, ERNG_NO_OS | ERNG_NO_HWRNG | ERNG_NO_RDSEED | ERNG_NO_JITTER) == ERNG_ERR_ENTROPY);
     /* two instances never agree */
@@ -177,6 +184,40 @@ static void test_fork(void)
     erng_free(r);
 }
 
+/* fork() while another thread is inside the generator must not deadlock the child */
+static atomic_int busy_stop;
+static void *busy(void *arg)
+{
+    uint8_t b[64];
+    while (!atomic_load(&busy_stop)) erng_bytes(arg, b, sizeof b);
+    return NULL;
+}
+
+static void test_fork_while_locked(void)
+{
+    erng_t *r;
+    pthread_t t;
+    int ok = 1;
+    CHECK(erng_new(&r, NULL, 0, ERNG_PREDICTION_RESISTANCE) == ERNG_OK);   /* long critical sections */
+    atomic_store(&busy_stop, 0);
+    pthread_create(&t, NULL, busy, r);
+    for (int i = 0; i < 20; i++) {
+        int status;
+        pid_t pid = fork();
+        if (pid == 0) {
+            uint8_t b[32];
+            alarm(10);                           /* a deadlock shows up as SIGALRM */
+            _exit(erng_bytes(r, b, sizeof b) == ERNG_OK ? 0 : 1);
+        }
+        waitpid(pid, &status, 0);
+        ok &= WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    }
+    atomic_store(&busy_stop, 1);
+    pthread_join(t, NULL);
+    CHECK(ok);
+    erng_free(r);
+}
+
 static erng_t *shared;
 static uint8_t thread_out[8][4096];
 static void *worker(void *arg)
@@ -207,6 +248,7 @@ int main(void)
     test_sources();
     test_statistics();
     test_fork();
+    test_fork_while_locked();
     test_threads();
     printf("%d/%d checks passed\n", checks - failures, checks);
     return failures != 0;

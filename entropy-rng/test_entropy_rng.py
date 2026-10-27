@@ -1,6 +1,19 @@
-import collections, math, os, unittest
+import collections, copy, gc, math, os, threading, unittest, weakref
+import entropy_rng
 from entropy_rng import (HMACDRBG, EntropyRNG, EntropyError, HealthTests,
                          JitterSource, OSSource, EntropySource, mcv_min_entropy)
+
+
+class Fixed(EntropySource):
+    """Test source returning OS randomness with a chosen credit per byte."""
+    def __init__(self, name, per_byte):
+        self.name, self.per_byte = name, per_byte
+    def read(self, n): return os.urandom(n), self.per_byte * n
+
+
+class Broken(EntropySource):
+    name = "broken"
+    def read(self, n): raise OSError("device gone")
 
 
 class TestHMACDRBG(unittest.TestCase):
@@ -58,6 +71,25 @@ class TestRNG(unittest.TestCase):
         with self.assertRaises(EntropyError):
             EntropyRNG(sources=[Weak()])
 
+    def test_half_credit_sources_do_not_add_up(self):
+        # two half-credit sources together claim 8 bits/byte, but neither alone does
+        with self.assertRaises(EntropyError):
+            EntropyRNG(sources=[Fixed("hw1", 4.0), Fixed("hw2", 4.0)])
+        EntropyRNG(sources=[Fixed("hw1", 4.0), Fixed("full", 8.0)])
+
+    def test_overclaimed_credit_is_capped(self):
+        class Liar(EntropySource):
+            name = "liar"
+            def read(self, n): return b"\x00", 10_000.0   # 1 byte "worth" 10 000 bits
+        with self.assertRaises(EntropyError):
+            EntropyRNG(sources=[Liar()])
+
+    def test_failed_source_is_reported(self):
+        rng = EntropyRNG(sources=[Broken(), OSSource()])
+        rng.random_bytes(8)
+        self.assertEqual(rng.pool.failures["broken"], 1)
+        self.assertIn("broken=1", rng.describe())
+
     def test_byte_distribution(self):
         data = self.rng.random_bytes(1 << 20)
         c = collections.Counter(data)
@@ -87,6 +119,68 @@ class TestRNG(unittest.TestCase):
     def test_prediction_resistance(self):
         rng = EntropyRNG(prediction_resistance=True)
         self.assertEqual(len(rng.random_bytes(100)), 100)
+
+    @staticmethod
+    def _clone(rng):
+        """Copy of the generator as a VM snapshot/restore would produce it."""
+        twin = copy.copy(rng)
+        twin._drbg = copy.deepcopy(rng._drbg)
+        twin._lock = threading.Lock()
+        return twin
+
+    def test_snapshot_clone_default_mode_repeats(self):
+        # documents the limit: without prediction resistance a cloned state repeats
+        rng = EntropyRNG(); rng.random_bytes(16)
+        twin = self._clone(rng)
+        self.assertEqual(rng.random_bytes(32), twin.random_bytes(32))
+
+    def test_snapshot_clone_prediction_resistance_differs(self):
+        rng = EntropyRNG(prediction_resistance=True); rng.random_bytes(16)
+        twin = self._clone(rng)
+        self.assertNotEqual(rng.random_bytes(32), twin.random_bytes(32))
+
+    def test_resume_triggers_reseed(self):
+        rng = EntropyRNG(); rng.random_bytes(16); rng.random_bytes(16)
+        twin = self._clone(rng)
+        twin._skew -= 2 * entropy_rng.CLOCK_SKEW_RESEED_NS   # as if the clocks diverged
+        self.assertNotEqual(rng.random_bytes(32), twin.random_bytes(32))
+        self.assertEqual(twin._drbg.reseed_counter, 2)       # reseeded, then one generate
+
+
+class TestLifetime(unittest.TestCase):
+    def test_instances_are_not_kept_alive(self):
+        rng = EntropyRNG()
+        ref = weakref.ref(rng)
+        del rng
+        gc.collect()
+        self.assertIsNone(ref())
+
+    def test_close_wipes_state(self):
+        with EntropyRNG() as rng:
+            drbg = rng._drbg
+            rng.random_bytes(8)
+        self.assertEqual(bytes(drbg.K), bytes(32))
+        self.assertEqual(bytes(drbg.V), bytes(32))
+        with self.assertRaises(ValueError):
+            rng.random_bytes(8)
+
+    def test_fork_while_lock_held(self):
+        rng = EntropyRNG()
+        rng._lock.acquire()           # another thread is inside random_bytes
+        try:
+            r, w = os.pipe()
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    os.write(w, rng.random_bytes(32))
+                finally:
+                    os._exit(0)
+            os.close(w)
+            os.waitpid(pid, 0)
+            self.assertEqual(len(os.read(r, 32)), 32)
+            os.close(r)
+        finally:
+            rng._lock.release()
 
 
 if __name__ == "__main__":

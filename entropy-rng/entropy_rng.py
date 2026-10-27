@@ -8,9 +8,14 @@ Sources:
     * HWRNGSource   - /dev/hwrng hardware RNG, if present and readable
     * JitterSource  - CPU timing jitter (in the spirit of Linux jitterentropy)
 
-The DRBG is seeded only once at least SEED_ENTROPY_BITS of *credited* entropy
-have been collected. Raw jitter samples pass continuous health tests
-(SP 800-90B repetition count + adaptive proportion) before they are credited.
+The DRBG is seeded only once a single source on its own credits at least
+SEED_ENTROPY_BITS; credits are never summed across sources. Raw jitter samples
+pass continuous health tests (SP 800-90B repetition count + adaptive
+proportion) before they are credited.
+
+Python cannot reliably erase memory: random_bytes() returns immutable bytes and
+interpreter copies may linger. For real keys use secrets.token_bytes() or the C
+version in c/.
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ import math
 import os
 import threading
 import time
+import weakref
 
 SEED_ENTROPY_BITS = 256          # security strength of HMAC-DRBG-SHA256
 RESEED_INTERVAL = 1 << 16        # generate() calls between automatic reseeds
@@ -185,22 +191,30 @@ class EntropyPool:
         self.sources = sources
         if not sources:
             raise EntropyError("no entropy sources available")
+        self.failures: collections.Counter[str] = collections.Counter()
 
     def gather(self, bits: int = SEED_ENTROPY_BITS) -> bytes:
+        """Mix every source into the pool. A source that raises EntropyError or
+        OSError is skipped and counted in self.failures.
+
+        Credits are not summed: the seed is accepted only if one source on its
+        own credits `bits`. Half-credit sources (hwrng) add defence in depth but
+        can never carry the seed, alone or together with others. A source cannot
+        credit more than 8 bits per byte it returned."""
         h = hashlib.sha512(b"entropy-rng/pool/v1")
-        credited = 0.0
+        best = 0.0
         per_source = math.ceil(bits / 8)
         for src in self.sources:
             try:
                 data, ent = src.read(per_source)
-            except EntropyError:
-                continue                       # a failing source adds nothing
+            except (EntropyError, OSError):
+                self.failures[src.name] += 1   # a failing source adds nothing
+                continue
             h.update(src.name.encode() + len(data).to_bytes(4, "big") + data)
-            credited += ent
+            best = max(best, min(ent, 8.0 * len(data)))
         h.update(time.time_ns().to_bytes(8, "big") + os.getpid().to_bytes(4, "big"))
-        # Credits are summed: the threshold is met if the sources together claim enough.
-        if credited < bits:
-            raise EntropyError(f"insufficient entropy: {credited:.0f}/{bits} bits")
+        if best < bits:
+            raise EntropyError(f"insufficient entropy: best single source {best:.0f}/{bits} bits")
         return h.digest()
 
 
@@ -209,9 +223,11 @@ class EntropyPool:
 # --------------------------------------------------------------------------- #
 
 class HMACDRBG:
+    # K and V are bytearrays updated in place, so wipe() can overwrite them.
+    # Intermediate bytes objects inside hmac/hashlib are beyond our reach.
     def __init__(self, entropy: bytes, nonce: bytes = b"", personalization: bytes = b""):
-        self.K = b"\x00" * 32
-        self.V = b"\x01" * 32
+        self.K = bytearray(32)
+        self.V = bytearray(b"\x01" * 32)
         self._update(entropy + nonce + personalization)
         self.reseed_counter = 1
 
@@ -219,11 +235,16 @@ class HMACDRBG:
         return hmac.new(key, data, hashlib.sha256).digest()
 
     def _update(self, provided: bytes = b"") -> None:
-        self.K = self._hmac(self.K, self.V + b"\x00" + provided)
-        self.V = self._hmac(self.K, self.V)
+        self.K[:] = self._hmac(self.K, self.V + b"\x00" + provided)
+        self.V[:] = self._hmac(self.K, self.V)
         if provided:
-            self.K = self._hmac(self.K, self.V + b"\x01" + provided)
-            self.V = self._hmac(self.K, self.V)
+            self.K[:] = self._hmac(self.K, self.V + b"\x01" + provided)
+            self.V[:] = self._hmac(self.K, self.V)
+
+    def wipe(self) -> None:
+        self.K[:] = bytes(32)
+        self.V[:] = bytes(32)
+        self.reseed_counter = 0
 
     def reseed(self, entropy: bytes, additional: bytes = b"") -> None:
         self._update(entropy + additional)
@@ -236,7 +257,7 @@ class HMACDRBG:
             self._update(additional)
         out = bytearray()
         while len(out) < nbytes:
-            self.V = self._hmac(self.K, self.V)
+            self.V[:] = self._hmac(self.K, self.V)
             out += self.V
         self._update(additional)
         self.reseed_counter += 1
@@ -259,11 +280,40 @@ def default_sources() -> list[EntropySource]:
     return sources
 
 
+# One at-fork hook for all generators. A per-instance hook would keep every
+# instance (and its DRBG state) alive for the life of the process.
+_instances: weakref.WeakSet[EntropyRNG] = weakref.WeakSet()
+
+
+def _after_fork_in_child() -> None:
+    # Only replace the locks: another thread may have held one during fork().
+    # The reseed itself happens lazily on the next request (pid check).
+    for rng in list(_instances):
+        rng._lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork_in_child)
+
+# Suspend/resume (and VM restores the guest kernel accounts as suspended time)
+# moves CLOCK_BOOTTIME away from CLOCK_MONOTONIC.
+CLOCK_SKEW_RESEED_NS = 1_000_000_000
+
+
+def _clock_skew() -> int:
+    if not hasattr(time, "CLOCK_BOOTTIME"):
+        return 0
+    return time.clock_gettime_ns(time.CLOCK_BOOTTIME) - time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+
+
 class EntropyRNG:
     """Thread- and fork-safe CSPRNG seeded from multiple entropy sources.
 
     prediction_resistance=True reseeds from the pool before every request
-    (slower, but compromise of the internal state does not reveal future output).
+    (slower, but compromise of the internal state does not reveal future output,
+    and a cloned VM or restored snapshot does not repeat output). Use it for keys.
+
+    Call close() (or use `with EntropyRNG() as rng:`) to overwrite the DRBG state.
     """
 
     def __init__(self, sources: list[EntropySource] | None = None,
@@ -272,29 +322,46 @@ class EntropyRNG:
         self.prediction_resistance = prediction_resistance
         self._lock = threading.Lock()
         seed = self.pool.gather(SEED_ENTROPY_BITS + SEED_ENTROPY_BITS // 2)  # entropy + nonce
-        self._drbg = HMACDRBG(seed, personalization=personalization)
+        self._drbg: HMACDRBG | None = HMACDRBG(seed, personalization=personalization)
         self._pid = os.getpid()
-        if hasattr(os, "register_at_fork"):
-            os.register_at_fork(after_in_child=self._after_fork)
+        self._skew = _clock_skew()
+        _instances.add(self)
 
-    def _after_fork(self):
-        self._lock = threading.Lock()
-        self._reseed(b"fork")
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def close(self) -> None:
+        """Overwrite K and V (best effort) and stop using this generator."""
+        with self._lock:
+            if self._drbg is not None:
+                self._drbg.wipe()
+                self._drbg = None
+        _instances.discard(self)
 
     def _reseed(self, additional: bytes = b"") -> None:
         self._drbg.reseed(self.pool.gather(), additional)
         self._pid = os.getpid()
+        self._skew = _clock_skew()
 
     def random_bytes(self, n: int) -> bytes:
         with self._lock:
+            if self._drbg is None:
+                raise ValueError("generator is closed")
             if os.getpid() != self._pid:
                 self._reseed(b"fork")
+            if abs(_clock_skew() - self._skew) > CLOCK_SKEW_RESEED_NS:
+                self._reseed(b"resume")    # the state may now exist twice
             out = bytearray()
             while len(out) < n:
                 if self.prediction_resistance or self._drbg.reseed_counter > RESEED_INTERVAL:
                     self._reseed()
                 out += self._drbg.generate(min(n - len(out), MAX_REQUEST_BYTES))
-            return bytes(out)
+            result = bytes(out)
+            out[:] = bytes(len(out))
+            return result
 
     def randbits(self, k: int) -> int:
         if k <= 0:
@@ -326,7 +393,10 @@ class EntropyRNG:
                 parts.append(f"jitter (measured H={s.estimate:.2f} bits/sample, credited {s.h:.2f})")
             else:
                 parts.append(s.name)
-        return "sources: " + ", ".join(parts)
+        text = "sources: " + ", ".join(parts)
+        if self.pool.failures:
+            text += " [failures: " + ", ".join(f"{k}={v}" for k, v in sorted(self.pool.failures.items())) + "]"
+        return text
 
 
 if __name__ == "__main__":

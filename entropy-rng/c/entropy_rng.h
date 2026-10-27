@@ -6,11 +6,16 @@
  *
  * Sources (all optional, used together when available):
  *   os      getrandom(2), kernel CSPRNG              credited 8 bits/byte
- *   hwrng   /dev/hwrng hardware RNG                  credited 4 bits/byte
- *   rdseed  x86 RDSEED instruction                   credited 4 bits/byte
+ *   hwrng   /dev/hwrng hardware RNG                  credited 4 bits/byte (defence in depth only)
+ *   rdseed  x86 RDSEED instruction                   credited 4 bits/byte (defence in depth only)
  *   jitter  CPU execution-time jitter (rdtsc)        measured at start-up, credited <= 1 bit/sample
  *
- * An erng_t is thread-safe and reseeds itself after fork().
+ * Credits are not summed: a seed needs one source (in practice os or jitter) to
+ * credit the full target on its own. Failed sources are counted in erng_describe().
+ *
+ * An erng_t is thread-safe and reseeds itself after fork() and after suspend/resume.
+ * A VM snapshot/restore or clone copies its state: use ERNG_PREDICTION_RESISTANCE
+ * for keys so every request draws fresh entropy.
  */
 #ifndef ENTROPY_RNG_H
 #define ENTROPY_RNG_H
